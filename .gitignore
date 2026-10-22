@@ -1,0 +1,26 @@
+# Cargo builds (each pane uses its own target-* dir)
+target*/
+
+# Packaged release (attached to the GitHub release, not versioned)
+/AOCompBuilder.exe
+/dist/
+
+# Downloaded by scripts/fetch_icons.ps1
+/assets/icons/
+/icons-failed.txt
+
+# Heavy dumps fetched by scripts/fetch_dumps.ps1, and the cache derived from them
+/assets/data/items.json
+/assets/data/spells.json
+/assets/data/items.txt
+/assets/data/catalog.json
+*.part
+
+# Scratch lists left by the first icon download
+/assets/data/failed.txt
+/assets/data/item_ids.txt
+/assets/data/spell_icons.txt
+
+# User data (builds, compositions) and agent workspace state
+/userdata/
+/.hangar/
