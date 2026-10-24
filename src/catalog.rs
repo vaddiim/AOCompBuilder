@@ -116,7 +116,7 @@ pub struct Spell {
 }
 
 /// Bumped whenever the cached `catalog.json` layout or filtering changes; stale caches are rebuilt.
-const SCHEMA: u32 = 9;
+const SCHEMA: u32 = 10;
 
 /// The build only deals with this tier; item quality is ignored and enchants live in the build.
 pub const TIER: u8 = 8;
@@ -356,7 +356,7 @@ fn parse_item(
     let mut spell_choices = Vec::new();
     let mut passives = Vec::new();
     let mut passive_choices = Vec::new();
-    for s in list(&spell_list(raw, by_id)["craftspell"]) {
+    for s in spell_list(raw, by_id) {
         let Some(sid) = attr(s, "uniquename") else {
             continue;
         };
@@ -566,8 +566,10 @@ fn has_render_icon(id: &str) -> bool {
     !(id.contains("VANITY") || id.contains("PROTOTYPE") || MISSING.contains(&id))
 }
 
-/// A `craftingspelllist` is either inline or `@reference` to another item's list.
-fn spell_list<'a>(raw: &'a Value, by_id: &HashMap<&str, &'a Value>) -> &'a Value {
+/// A `craftingspelllist` is either inline or `@reference` to another item's list, optionally
+/// with its own `removespell`/`craftspell` on top (artifact weapons swap the base weapon's E this way).
+fn spell_list<'a>(raw: &'a Value, by_id: &HashMap<&str, &'a Value>) -> Vec<&'a Value> {
+    let mut lists = vec![&raw["craftingspelllist"]];
     let mut cur = raw;
     for _ in 0..16 {
         let Some(target) = attr(&cur["craftingspelllist"], "reference") else {
@@ -575,8 +577,19 @@ fn spell_list<'a>(raw: &'a Value, by_id: &HashMap<&str, &'a Value>) -> &'a Value
         };
         let Some(next) = by_id.get(target) else { break };
         cur = next;
+        lists.push(&cur["craftingspelllist"]);
     }
-    &cur["craftingspelllist"]
+    // Base list first, then each derived list's removals and additions.
+    let mut spells: Vec<&Value> = Vec::new();
+    for l in lists.into_iter().rev() {
+        let removed: Vec<&str> = list(&l["removespell"])
+            .into_iter()
+            .filter_map(|r| attr(r, "uniquename"))
+            .collect();
+        spells.retain(|s| !attr(s, "uniquename").is_some_and(|n| removed.contains(&n)));
+        spells.extend(list(&l["craftspell"]));
+    }
+    spells
 }
 
 /// One localized string pair from `spell_loc.json` (`tag -> {en, fr}`).
@@ -773,6 +786,24 @@ fn prettify(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_weapons_replace_the_base_e_spell() {
+        let catalog = Catalog::load(Path::new("assets/data")).unwrap();
+        let e = |id: &str| -> Vec<String> {
+            let item = catalog.items.iter().find(|i| i.id == id).expect(id);
+            item.spells
+                .iter()
+                .filter(|c| c.slot == 3)
+                .map(|c| c.id.clone())
+                .collect()
+        };
+        let base = e("T8_MAIN_SWORD");
+        let morgana = e("T8_MAIN_SCIMITAR_MORGANA");
+        assert!(base.contains(&"MIGHTYBLOW".to_owned()));
+        assert!(!morgana.contains(&"MIGHTYBLOW".to_owned()));
+        assert!(morgana.contains(&"MIGHTYSWING".to_owned()));
+    }
 
     #[test]
     fn dumps_yield_weapons_with_spells() {
