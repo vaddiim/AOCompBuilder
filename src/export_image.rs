@@ -1,9 +1,10 @@
 //! PNG export of a build or a composition, drawn off-screen into memory (never a screen capture).
 //!
-//! Equipment only: no spells or passives. Item icons come from render.albiononline.com at 217 px,
-//! downloaded on demand into `userdata/cache/icons_hd`; offline, the 64 px icons of `assets/icons`
-//! are used instead. Nothing here depends on egui, so it can run on a worker thread.
+//! Equipment and swaps only: no spells or passives. Item icons come from render.albiononline.com at
+//! 217 px, downloaded on demand into `userdata/cache/icons_hd`; offline, the 64 px icons of
+//! `assets/icons` are used instead. Nothing here depends on egui, so it can run on a worker thread.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -338,20 +339,51 @@ fn download(agent: &ureq::Agent, key: &IconKey, cache_path: &Path) -> Result<Rgb
 
 const FONT: &[u8] = include_bytes!("../assets/fonts/Ubuntu-Light.ttf");
 
-const BG_TOP: [u8; 3] = [27, 30, 39];
-const BG_BOTTOM: [u8; 3] = [14, 15, 20];
-const CARD: [u8; 3] = [38, 42, 54];
-const CARD_BORDER: [u8; 3] = [64, 69, 86];
-const TEXT: [u8; 3] = [236, 236, 240];
-const DIM: [u8; 3] = [140, 146, 162];
-const GOLD: [u8; 3] = [240, 180, 60];
+// Warm greys with gold accents, like the app itself (`ui/theme.rs`).
+const BG_TOP: [u8; 3] = [30, 26, 23];
+const BG_BOTTOM: [u8; 3] = [12, 11, 10];
+/// Copper haze behind the title.
+const GLOW: [u8; 3] = [184, 115, 51];
+const CARD: [u8; 3] = [36, 32, 28];
+const CARD_EMPTY: [u8; 3] = [26, 23, 20];
+const CARD_BORDER: [u8; 3] = [70, 60, 48];
+/// The inventory-slot square every icon sits in.
+const WELL: [u8; 3] = [17, 15, 13];
+const WELL_BORDER: [u8; 3] = [56, 48, 40];
+const PILL: [u8; 3] = [44, 39, 33];
+const TEXT: [u8; 3] = [235, 227, 212];
+const DIM: [u8; 3] = [158, 147, 131];
+/// Names of empty slots.
+const FAINT: [u8; 3] = [98, 89, 78];
+const GOLD: [u8; 3] = [232, 184, 86];
+const DANGER: [u8; 3] = [222, 92, 78];
+/// Text and outlines on coloured fills.
+const INK: [u8; 3] = [24, 18, 12];
 
+/// In-game enchantment colours, as in the app.
 fn enchant_color(enchant: u8) -> [u8; 3] {
     match enchant {
-        1 => [88, 200, 120],
-        2 => [80, 150, 230],
-        3 => [170, 100, 230],
-        _ => GOLD,
+        1 => [88, 168, 84],
+        2 => [70, 140, 214],
+        3 => [160, 96, 210],
+        _ => [222, 170, 52],
+    }
+}
+
+/// Accent of a role, guessed from its name; gold for roles it does not recognise.
+fn role_color(role: &str) -> [u8; 3] {
+    let role = role.to_lowercase();
+    let any = |words: &[&str]| words.iter().any(|w| role.contains(w));
+    if any(&["heal", "soin", "soign"]) {
+        [116, 192, 104]
+    } else if any(&["tank"]) {
+        [86, 150, 222]
+    } else if any(&["supp", "util"]) {
+        [176, 124, 224]
+    } else if any(&["dps", "dmg", "damage", "dégât", "degat"]) {
+        [226, 100, 82]
+    } else {
+        GOLD
     }
 }
 
@@ -359,11 +391,24 @@ fn font() -> FontRef<'static> {
     FontRef::try_from_slice(FONT).expect("embedded font is valid")
 }
 
+fn lerp(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    std::array::from_fn(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
+}
+
+fn lighten(color: [u8; 3], by: u8) -> [u8; 3] {
+    color.map(|c| c.saturating_add(by))
+}
+
+/// Vertical gradient with a copper haze in the top-left corner, behind the title.
 fn background(w: u32, h: u32) -> RgbaImage {
-    RgbaImage::from_fn(w, h, |_, y| {
-        let t = y as f32 / h.max(1) as f32;
-        let c = |i: usize| (BG_TOP[i] as f32 + (BG_BOTTOM[i] as f32 - BG_TOP[i] as f32) * t) as u8;
-        Rgba([c(0), c(1), c(2), 255])
+    let (glow_x, glow_y) = (w as f32 * 0.15, -(h as f32) * 0.1);
+    let reach = w.max(h) as f32 * 0.75;
+    RgbaImage::from_fn(w, h, |x, y| {
+        let base = lerp(BG_TOP, BG_BOTTOM, y as f32 / h.max(1) as f32);
+        let d = (x as f32 - glow_x).hypot(y as f32 - glow_y);
+        let haze = (1.0 - d / reach).clamp(0.0, 1.0).powi(2) * 0.18;
+        let [r, g, b] = lerp(base, GLOW, haze);
+        Rgba([r, g, b, 255])
     })
 }
 
@@ -379,27 +424,118 @@ fn blend(img: &mut RgbaImage, x: i64, y: i64, color: [u8; 3], alpha: f32) {
     px.0[3] = 255;
 }
 
-/// Filled rectangle with anti-aliased rounded corners.
-fn round_rect(img: &mut RgbaImage, x: i64, y: i64, w: i64, h: i64, r: i64, color: [u8; 3]) {
+/// Rectangle `(x, y, w, h)` with anti-aliased rounded corners, shaded from `top` to `bottom` and
+/// laid at `alpha` opacity. `square_bottom` keeps the bottom corners square (a band across the top
+/// of a card).
+fn fill(
+    img: &mut RgbaImage,
+    (x, y, w, h): (i64, i64, i64, i64),
+    r: i64,
+    top: [u8; 3],
+    bottom: [u8; 3],
+    alpha: f32,
+    square_bottom: bool,
+) {
     let r = r.min(w / 2).min(h / 2).max(0);
     for py in y..y + h {
+        let color = lerp(top, bottom, (py - y) as f32 / (h - 1).max(1) as f32);
+        let below = if square_bottom { 0 } else { py - (y + h - r) };
+        let dy = (y + r - 1 - py).max(below).max(0) as f32;
         for px in x..x + w {
             let dx = (x + r - 1 - px).max(px - (x + w - r)).max(0) as f32;
-            let dy = (y + r - 1 - py).max(py - (y + h - r)).max(0) as f32;
             let coverage = if dx > 0.0 && dy > 0.0 {
                 (r as f32 - ((dx - 0.5).powi(2) + (dy - 0.5).powi(2)).sqrt() + 0.5).clamp(0.0, 1.0)
             } else {
                 1.0
             };
-            blend(img, px, py, color, coverage);
+            blend(img, px, py, color, coverage * alpha);
         }
     }
 }
 
-/// Card: a border-colored round rect with a slightly smaller fill on top.
-fn card(img: &mut RgbaImage, x: i64, y: i64, w: i64, h: i64, fill: [u8; 3]) {
+/// Filled rectangle with anti-aliased rounded corners.
+fn round_rect(img: &mut RgbaImage, x: i64, y: i64, w: i64, h: i64, r: i64, color: [u8; 3]) {
+    fill(img, (x, y, w, h), r, color, color, 1.0, false);
+}
+
+/// Soft shadow cast downwards by a rounded rectangle; draw it before the shape itself.
+fn shadow(img: &mut RgbaImage, x: i64, y: i64, w: i64, h: i64, r: i64) {
+    const BLUR: i64 = 24;
+    const DROP: i64 = 10;
+    const STRENGTH: f32 = 0.5;
+    let (cx, cy) = (
+        x as f32 + w as f32 / 2.0,
+        (y + DROP) as f32 + h as f32 / 2.0,
+    );
+    let (half_w, half_h) = (w as f32 / 2.0 - r as f32, h as f32 / 2.0 - r as f32);
+    for py in y + DROP - BLUR..y + DROP + h + BLUR {
+        for px in x - BLUR..x + w + BLUR {
+            // Signed distance to the rounded rectangle, negative inside.
+            let qx = (px as f32 + 0.5 - cx).abs() - half_w;
+            let qy = (py as f32 + 0.5 - cy).abs() - half_h;
+            let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r as f32;
+            let t = 1.0 - (d / BLUR as f32).clamp(0.0, 1.0);
+            blend(img, px, py, [0, 0, 0], STRENGTH * t * t);
+        }
+    }
+}
+
+/// Card: soft shadow, a border-coloured round rect, and a fill a little lighter at the top.
+fn card(img: &mut RgbaImage, x: i64, y: i64, w: i64, h: i64, color: [u8; 3]) {
+    shadow(img, x, y, w, h, 16);
     round_rect(img, x, y, w, h, 16, CARD_BORDER);
-    round_rect(img, x + 2, y + 2, w - 4, h - 4, 14, fill);
+    fill(
+        img,
+        (x + 2, y + 2, w - 4, h - 4),
+        14,
+        lighten(color, 10),
+        color,
+        1.0,
+        false,
+    );
+}
+
+/// Dark inventory-slot square behind an icon, a little deeper at the top.
+fn well(img: &mut RgbaImage, x: i64, y: i64, size: i64, r: i64) {
+    round_rect(img, x, y, size, size, r, WELL_BORDER);
+    fill(
+        img,
+        (x + 2, y + 2, size - 4, size - 4),
+        r - 2,
+        WELL,
+        lighten(WELL, 10),
+        1.0,
+        false,
+    );
+}
+
+const PILL_H: i64 = 40;
+const PILL_PX: f32 = 24.0;
+
+fn pill_width(font: &FontRef, text: &str, dot: bool) -> i64 {
+    let lead = if dot { 40 } else { 18 };
+    lead + text_width(font, PILL_PX, text).ceil() as i64 + 18
+}
+
+/// Rounded label at (x, y), with a coloured dot before the text when `dot` is set.
+fn pill(img: &mut RgbaImage, font: &FontRef, x: i64, y: i64, text: &str, dot: Option<[u8; 3]>) {
+    let w = pill_width(font, text, dot.is_some());
+    round_rect(img, x, y, w, PILL_H, PILL_H / 2, CARD_BORDER);
+    round_rect(img, x + 2, y + 2, w - 4, PILL_H - 4, PILL_H / 2 - 2, PILL);
+    if let Some(color) = dot {
+        round_rect(img, x + 18, y + PILL_H / 2 - 6, 12, 12, 6, color);
+    }
+    let lead = if dot.is_some() { 40 } else { 18 };
+    draw_text(
+        img,
+        font,
+        PILL_PX,
+        (x + lead) as f32,
+        centered_top(PILL_PX, (y + PILL_H / 2) as f32),
+        TEXT,
+        text,
+        false,
+    );
 }
 
 fn text_width(font: &FontRef, px: f32, text: &str) -> f32 {
@@ -415,6 +551,12 @@ fn text_width(font: &FontRef, px: f32, text: &str) -> f32 {
         prev = Some(id);
     }
     width
+}
+
+/// Top of a line of `px` text whose capitals are centred on `mid` (Ubuntu: ascent 0.83 of the
+/// line height, capitals 0.62).
+fn centered_top(px: f32, mid: f32) -> f32 {
+    mid - px * 0.52
 }
 
 /// Draws `text` with its top-left at (x, y); `bold` thickens it by drawing it twice.
@@ -517,40 +659,102 @@ fn wrap(font: &FontRef, px: f32, text: &str, max_w: f32, max_lines: usize) -> Ve
     lines
 }
 
-/// Draws `icon` scaled to a `size` square at (x, y), or a placeholder when the icon is missing.
+// Render-service icons have a transparent margin around their frame: the frame spans 17..194 of
+// the 217 px picture across and 18..191 down (it is a little shorter than wide).
+const FRAME_LEFT: f32 = 17.0 / 217.0;
+const FRAME_TOP: f32 = 16.0 / 217.0; // 18, less half the 4 px height difference
+const FRAME_SIZE: f32 = 177.0 / 217.0;
+
+/// Square the whole picture is drawn in so that its frame fills the `size` square at (x, y), less
+/// `inset` on each side. Glows outside the frame spill over the square, as in the game.
+fn icon_box(x: i64, y: i64, size: i64, inset: i64) -> (i64, i64, u32) {
+    let full = (size - 2 * inset) as f32 / FRAME_SIZE;
+    (
+        x + inset - (full * FRAME_LEFT).round() as i64,
+        y + inset - (full * FRAME_TOP).round() as i64,
+        full.round() as u32,
+    )
+}
+
+/// Draws `icon` with its frame fitted to the `size` square at (x, y) (see [`icon_box`]), or a
+/// placeholder when the icon is missing.
 fn draw_icon(
     img: &mut RgbaImage,
     font: &FontRef,
     icon: Option<&RgbaImage>,
     x: i64,
     y: i64,
-    size: u32,
+    size: i64,
+    inset: i64,
 ) {
     match icon {
         Some(icon) => {
-            let scaled;
-            let icon = if icon.dimensions() == (size, size) {
-                icon
-            } else {
-                scaled = imageops::resize(icon, size, size, imageops::FilterType::Lanczos3);
-                &scaled
-            };
-            imageops::overlay(img, icon, x, y);
+            let (ix, iy, full) = icon_box(x, y, size, inset);
+            imageops::overlay(img, &*fit(icon, full), ix, iy);
         }
         None => {
-            round_rect(img, x, y, size as i64, size as i64, 10, [52, 56, 70]);
+            let pad = size / 8;
+            round_rect(
+                img,
+                x + pad,
+                y + pad,
+                size - 2 * pad,
+                size - 2 * pad,
+                10,
+                [52, 46, 40],
+            );
+            let px = size as f32 * 0.4;
             draw_centered(
                 img,
                 font,
-                size as f32 * 0.5,
-                x as f32 + size as f32 / 2.0,
-                y as f32 + size as f32 * 0.22,
+                px,
+                (x + size / 2) as f32,
+                centered_top(px, (y + size / 2) as f32),
                 DIM,
                 "?",
                 false,
             );
         }
     }
+}
+
+fn fit(icon: &RgbaImage, size: u32) -> Cow<'_, RgbaImage> {
+    if icon.dimensions() == (size, size) {
+        Cow::Borrowed(icon)
+    } else {
+        Cow::Owned(imageops::resize(
+            icon,
+            size,
+            size,
+            imageops::FilterType::Lanczos3,
+        ))
+    }
+}
+
+/// `icon` faded to grey, placed like [`draw_icon`]: the two-handed weapon shown again in its empty
+/// off-hand slot, as in the game.
+fn draw_ghost(img: &mut RgbaImage, icon: &RgbaImage, x: i64, y: i64, size: i64, inset: i64) {
+    let (ix, iy, full) = icon_box(x, y, size, inset);
+    for (px, py, p) in fit(icon, full).enumerate_pixels() {
+        let grey = (0.3 * p[0] as f32 + 0.59 * p[1] as f32 + 0.11 * p[2] as f32) as u8;
+        blend(
+            img,
+            ix + px as i64,
+            iy + py as i64,
+            [grey; 3],
+            p[3] as f32 / 255.0 * 0.3,
+        );
+    }
+}
+
+/// The build's main-hand icon when the weapon is two-handed, for the ghost in its off-hand slot.
+fn two_handed_icon<'a>(build: &Build, items: &Items, icons: &'a Icons) -> Option<&'a RgbaImage> {
+    let main = build.get(Slot::MainHand)?;
+    let item = items.get(&main.item).filter(|i| i.two_handed)?;
+    icons.get(&IconKey {
+        icon: item.icon.clone(),
+        enchant: main.enchant,
+    })
 }
 
 /// `.3` pill at the bottom-right corner of an icon; nothing for enchant 0.
@@ -561,7 +765,7 @@ fn draw_badge(img: &mut RgbaImage, font: &FontRef, enchant: u8, right: i64, bott
     let label = format!(".{enchant}");
     let w = (text_width(font, px, &label) + px * 0.7).round() as i64;
     let h = (px * 1.3).round() as i64;
-    round_rect(img, right - w, bottom - h, w, h, h / 2, [18, 19, 26]);
+    round_rect(img, right - w, bottom - h, w, h, h / 2, INK);
     round_rect(
         img,
         right - w + 2,
@@ -577,7 +781,7 @@ fn draw_badge(img: &mut RgbaImage, font: &FontRef, enchant: u8, right: i64, bott
         px,
         (right - w) as f32 + px * 0.35,
         (bottom - h) as f32 + px * 0.15,
-        [18, 19, 26],
+        INK,
         &label,
         true,
     );
@@ -614,8 +818,12 @@ pub fn render_build(build: &Build, items: &Items, icons: &Icons) -> Result<RgbaI
     const W: i64 = 2400;
     const COLS: i64 = 5;
     const ICON: i64 = 217;
+    /// Gap between the slot square's edge and the frame of its icon.
+    const ICON_INSET: i64 = 12;
     const SWAP: i64 = 72;
     const SWAP_GAP: i64 = 8;
+    /// Rule and "Swaps" heading above the swap icons.
+    const SWAP_HEAD: i64 = 50;
     const PAD: i64 = 16;
     let font = font();
 
@@ -629,7 +837,7 @@ pub fn render_build(build: &Build, items: &Items, icons: &Icons) -> Result<RgbaI
         .unwrap_or(0);
     let swap_rows = ((max_swaps + per_row - 1) / per_row).min(2);
     let swap_area = if swap_rows > 0 {
-        12 + swap_rows * SWAP + (swap_rows - 1) * SWAP_GAP
+        SWAP_HEAD + swap_rows * SWAP + (swap_rows - 1) * SWAP_GAP
     } else {
         0
     };
@@ -681,6 +889,7 @@ pub fn render_build(build: &Build, items: &Items, icons: &Icons) -> Result<RgbaI
         .get(Slot::MainHand)
         .and_then(|e| items.get(&e.item))
         .is_some_and(|i| i.two_handed);
+    let ghost = two_handed_icon(build, items, icons);
 
     for (n, slot) in Slot::ALL.into_iter().enumerate() {
         let (col, row) = (n as i64 % COLS, n as i64 / COLS);
@@ -693,11 +902,7 @@ pub fn render_build(build: &Build, items: &Items, icons: &Icons) -> Result<RgbaI
             y,
             card_w,
             card_h,
-            if equipped.is_some() {
-                CARD
-            } else {
-                [30, 33, 42]
-            },
+            if equipped.is_some() { CARD } else { CARD_EMPTY },
         );
         draw_text(
             &mut img,
@@ -712,19 +917,25 @@ pub fn render_build(build: &Build, items: &Items, icons: &Icons) -> Result<RgbaI
 
         let icon_x = x + (card_w - ICON) / 2;
         let icon_y = y + PAD + 36 + 8;
+        let name_y = icon_y + ICON + 10;
+        well(&mut img, icon_x, icon_y, ICON, 22);
         let Some(e) = equipped else {
-            let note = if slot == Slot::OffHand && two_handed {
-                "Arme à deux mains"
+            let off_hand_of_two_handed = slot == Slot::OffHand && two_handed;
+            if let Some(ghost) = ghost.filter(|_| off_hand_of_two_handed) {
+                draw_ghost(&mut img, ghost, icon_x, icon_y, ICON, ICON_INSET);
+            }
+            let (note, color) = if off_hand_of_two_handed {
+                ("Arme à deux mains", DIM)
             } else {
-                "—"
+                ("Vide", FAINT)
             };
             draw_centered(
                 &mut img,
                 &font,
                 30.0,
                 (x + card_w / 2) as f32,
-                (icon_y + ICON / 2 - 18) as f32,
-                DIM,
+                name_y as f32,
+                color,
                 note,
                 false,
             );
@@ -732,7 +943,7 @@ pub fn render_build(build: &Build, items: &Items, icons: &Icons) -> Result<RgbaI
         };
 
         let (icon, name) = icon_for(icons, items, &e.item, e.enchant);
-        draw_icon(&mut img, &font, icon, icon_x, icon_y, ICON as u32);
+        draw_icon(&mut img, &font, icon, icon_x, icon_y, ICON, ICON_INSET);
         draw_badge(
             &mut img,
             &font,
@@ -742,7 +953,6 @@ pub fn render_build(build: &Build, items: &Items, icons: &Icons) -> Result<RgbaI
             34.0,
         );
 
-        let name_y = icon_y + ICON + 10;
         for (i, line) in wrap(&font, 30.0, &name, (card_w - 2 * PAD) as f32, 2)
             .iter()
             .enumerate()
@@ -758,30 +968,47 @@ pub fn render_build(build: &Build, items: &Items, icons: &Icons) -> Result<RgbaI
                 false,
             );
         }
-        draw_swaps(
-            &mut img,
-            &font,
-            items,
-            icons,
-            e,
-            x + PAD,
-            name_y + 72 + 12,
-            (per_row * swap_rows) as usize,
-            per_row,
-            SWAP,
-        );
+        if !e.swaps.is_empty() {
+            let top = name_y + 72 + 6;
+            fill(
+                &mut img,
+                (x + PAD, top, card_w - 2 * PAD, 2),
+                0,
+                CARD_BORDER,
+                CARD_BORDER,
+                1.0,
+                false,
+            );
+            draw_text(
+                &mut img,
+                &font,
+                24.0,
+                (x + PAD) as f32,
+                (top + 12) as f32,
+                DIM,
+                &format!("Swaps ({})", e.swaps.len()),
+                false,
+            );
+            draw_swaps(
+                &mut img,
+                &font,
+                items,
+                icons,
+                e,
+                x + PAD,
+                name_y + 72 + SWAP_HEAD,
+                (per_row * swap_rows) as usize,
+                per_row,
+                (SWAP, SWAP_GAP),
+            );
+        }
     }
 
-    let footer = "AO Comp Builder";
-    draw_text(
+    draw_signature(
         &mut img,
         &font,
-        24.0,
-        (W - MARGIN) as f32 - text_width(&font, 24.0, footer),
+        (W - MARGIN) as f32,
         (height - footer_h + 14) as f32,
-        DIM,
-        footer,
-        false,
     );
     Ok(img)
 }
@@ -798,7 +1025,7 @@ fn draw_swaps(
     y: i64,
     capacity: usize,
     per_row: i64,
-    size: i64,
+    (size, gap): (i64, i64),
 ) {
     let total = equipped.swaps.len();
     if total == 0 || capacity == 0 {
@@ -809,29 +1036,32 @@ fn draw_swaps(
     } else {
         total
     };
+    let cell = |i: i64| {
+        (
+            x + (i % per_row) * (size + gap),
+            y + (i / per_row) * (size + gap),
+        )
+    };
+    let radius = (size / 6).max(6);
     for (i, swap) in equipped.swaps.iter().take(shown).enumerate() {
-        let (cx, cy) = (
-            x + (i as i64 % per_row) * (size + 8),
-            y + (i as i64 / per_row) * (size + 8),
-        );
+        let (cx, cy) = cell(i as i64);
         let (icon, _) = icon_for(icons, items, &swap.item, swap.enchant);
-        round_rect(img, cx, cy, size, size, 10, [28, 31, 40]);
-        draw_icon(img, font, icon, cx, cy, size as u32);
-        draw_badge(img, font, swap.enchant, cx + size, cy + size, 20.0);
+        well(img, cx, cy, size, radius);
+        // Small icons fill their square: a margin would make them unreadable.
+        draw_icon(img, font, icon, cx, cy, size, 0);
+        let badge_px = (size as f32 * 0.28).max(14.0);
+        draw_badge(img, font, swap.enchant, cx + size, cy + size, badge_px);
     }
     if total > shown {
-        let i = shown as i64;
-        let (cx, cy) = (
-            x + (i % per_row) * (size + 8),
-            y + (i / per_row) * (size + 8),
-        );
-        round_rect(img, cx, cy, size, size, 10, [28, 31, 40]);
+        let (cx, cy) = cell(shown as i64);
+        well(img, cx, cy, size, radius);
+        let px = size as f32 * 0.42;
         draw_centered(
             img,
             font,
-            30.0,
+            px,
             (cx + size / 2) as f32,
-            (cy + size / 2 - 18) as f32,
+            centered_top(px, (cy + size / 2) as f32),
             DIM,
             &format!("+{}", total - shown),
             true,
@@ -841,25 +1071,60 @@ fn draw_swaps(
 
 // ---- composition image ---------------------------------------------------------------------------
 
-/// Renders a composition: one column per member (role, player, build name, equipment), wrapped
-/// into rows of at most six columns.
+/// Renders a composition as a table: one row per member (role, player and build on the left, then
+/// the whole equipment on a single line with each item's swaps in small under it), one column per
+/// slot, so the same piece of every member lines up.
 pub fn render_comp(
     comp: &Composition,
     builds: &[Build],
     items: &Items,
     icons: &Icons,
 ) -> Result<RgbaImage> {
-    const COL_W: i64 = 330;
-    const MAX_COLS: i64 = 6;
-    const TILE: i64 = 120;
-    const TILE_GAP: i64 = 12;
-    const PAD: i64 = 16;
+    const MIN_W: i64 = 960;
+    /// Left part of a row: colour bar, role, player and build.
+    const INFO_W: i64 = 330;
+    const TILE: i64 = 128;
+    const TILE_GAP: i64 = 16;
+    /// Gap between a tile's edge and the frame of its icon.
+    const TILE_INSET: i64 = 6;
+    const MINI: i64 = 40;
+    const MINI_GAP: i64 = 4;
+    /// Room under a tile for its swaps.
+    const MINI_ROW: i64 = 10 + MINI;
+    const MINI_PER_TILE: usize = 3;
+    const PAD: i64 = 18;
+    const ROW_GAP: i64 = 16;
+    /// Slot names above the columns.
+    const LABELS_H: i64 = 44;
     let font = font();
 
     let members = comp.members.len() as i64;
-    let cols = members.clamp(1, MAX_COLS);
-    let rows = ((members + MAX_COLS - 1) / MAX_COLS).max(1);
-    let width = (2 * MARGIN + cols * COL_W + (cols - 1) * GAP).max(1400);
+    let resolved: Vec<Option<&Build>> = (0..comp.members.len())
+        .map(|i| comp.resolve(i, builds))
+        .collect();
+
+    // Slots nobody fills get no column (all of them show while no member has a build yet).
+    let filled = |slot: Slot, with_swaps: bool| {
+        resolved
+            .iter()
+            .flatten()
+            .filter_map(|b| b.get(slot))
+            .any(|e| !with_swaps || !e.swaps.is_empty())
+    };
+    let mut slots: Vec<Slot> = Slot::ALL
+        .into_iter()
+        .filter(|&s| filled(s, false))
+        .collect();
+    if slots.is_empty() {
+        slots = Slot::ALL.to_vec();
+    }
+    // All rows share one height, with room for swaps as soon as anyone has some.
+    let any_swaps = slots.iter().any(|&s| filled(s, true));
+    let columns = slots.len() as i64;
+    let grid_w = columns * TILE + (columns - 1) * TILE_GAP;
+    let grid_h = TILE + if any_swaps { MINI_ROW } else { 0 };
+    let row_w = INFO_W + grid_w + PAD;
+    let width = (2 * MARGIN + row_w).max(MIN_W);
 
     let title = if comp.name.trim().is_empty() {
         "Composition sans nom"
@@ -867,19 +1132,26 @@ pub fn render_comp(
         comp.name.trim()
     };
     let note_lines = wrap(&font, 30.0, &comp.notes, (width - 2 * MARGIN) as f32, 4);
-    let header_h = MARGIN
-        + 100
-        + if note_lines.is_empty() {
+    let pills_y = MARGIN + 124;
+    let notes_y = pills_y
+        + if comp.members.is_empty() {
             0
         } else {
-            note_lines.len() as i64 * 40 + 12
-        }
-        + 30;
+            PILL_H + 24
+        };
+    let header_h = notes_y + note_lines.len() as i64 * 40 + 36;
+    let any_player = comp.members.iter().any(|m| !m.player.trim().is_empty());
     let member_notes = comp.members.iter().any(|m| !m.note.trim().is_empty());
-    let col_head = PAD + 44 + 36 + 32 + if member_notes { 60 } else { 0 } + 12;
-    let col_h = col_head + 5 * (TILE + TILE_GAP) + PAD - TILE_GAP;
-    let footer_h = 56;
-    let height = header_h + rows * col_h + (rows - 1) * GAP + footer_h;
+    let info_h = 46 + if any_player { 36 } else { 0 } + 32 + if member_notes { 56 } else { 0 };
+    let row_h = info_h.max(grid_h) + 2 * PAD;
+    let table_top = header_h + LABELS_H;
+    let table_h = if members == 0 {
+        60
+    } else {
+        members * row_h + (members - 1) * ROW_GAP
+    };
+    let footer_h = 64;
+    let height = table_top + table_h + footer_h;
     // Memory is width x height x 4 bytes: refuse absurd compositions (imported strings can hold thousands of members).
     if width * height > MAX_PIXELS {
         bail!(
@@ -899,13 +1171,36 @@ pub fn render_comp(
         true,
     );
     round_rect(&mut img, MARGIN, MARGIN + 92, 220, 5, 2, GOLD);
+    if !comp.members.is_empty() {
+        // Head count, then each role with its colour ("2 DPS", "1 Heal"), as far as the width allows.
+        let count = format!(
+            "{members} {}",
+            if members > 1 { "joueurs" } else { "joueur" }
+        );
+        let roles = role_groups(comp).into_iter().map(|(role, n)| {
+            let color = role_color(&role);
+            (
+                format!("{n} {}", ellipsize(&font, PILL_PX, &role, 280.0)),
+                Some(color),
+            )
+        });
+        let mut px = MARGIN;
+        for (text, dot) in std::iter::once((count, None)).chain(roles) {
+            let w = pill_width(&font, &text, dot.is_some());
+            if px + w > width - MARGIN {
+                break;
+            }
+            pill(&mut img, &font, px, pills_y, &text, dot);
+            px += w + 12;
+        }
+    }
     for (i, line) in note_lines.iter().enumerate() {
         draw_text(
             &mut img,
             &font,
             30.0,
             MARGIN as f32,
-            (MARGIN + 112) as f32 + i as f32 * 40.0,
+            (notes_y + i as i64 * 40) as f32,
             DIM,
             line,
             false,
@@ -924,107 +1219,189 @@ pub fn render_comp(
         );
     }
 
-    for (n, member) in comp.members.iter().enumerate() {
-        let (col, row) = (n as i64 % MAX_COLS, n as i64 / MAX_COLS);
-        let x = MARGIN + col * (COL_W + GAP);
-        let y = header_h + row * (col_h + GAP);
-        let inner = (COL_W - 2 * PAD) as f32;
-        let cx = (x + COL_W / 2) as f32;
-        let build = comp.resolve(n, builds);
-        card(&mut img, x, y, COL_W, col_h, CARD);
+    // Rows are centred when the image is held wider than them by MIN_W.
+    let left = (width - row_w) / 2;
+    let grid_x = left + INFO_W;
+    let column_x = |i: usize| grid_x + i as i64 * (TILE + TILE_GAP);
+    if !comp.members.is_empty() {
+        for (i, &slot) in slots.iter().enumerate() {
+            let label = if slot == Slot::OffHand {
+                "Main sec."
+            } else {
+                slot.label()
+            };
+            draw_centered(
+                &mut img,
+                &font,
+                22.0,
+                (column_x(i) + TILE / 2) as f32,
+                (header_h + 6) as f32,
+                DIM,
+                &ellipsize(&font, 22.0, label, (TILE + TILE_GAP - 6) as f32),
+                false,
+            );
+        }
+    }
 
+    let info_x = left + 40;
+    let info_w = (INFO_W - 40 - 20) as f32;
+    for (n, member) in comp.members.iter().enumerate() {
+        let y = table_top + n as i64 * (row_h + ROW_GAP);
+        let build = resolved[n];
         let role = if member.role.trim().is_empty() {
             "Rôle"
         } else {
             member.role.trim()
         };
-        draw_centered(
-            &mut img,
-            &font,
-            40.0,
-            cx,
-            (y + PAD) as f32,
-            GOLD,
-            &ellipsize(&font, 40.0, role, inner),
-            true,
-        );
-        let player = if member.player.trim().is_empty() {
-            "—"
-        } else {
-            member.player.trim()
+        let accent = role_color(role);
+
+        // The whole row is faintly tinted with the role colour, with a bar of it down the left edge.
+        card(&mut img, left, y, row_w, row_h, lerp(CARD, accent, 0.07));
+        round_rect(&mut img, left + 16, y + 16, 6, row_h - 32, 3, accent);
+
+        let mut ty = y + PAD + (row_h - 2 * PAD - info_h) / 2;
+        let mut line = |img: &mut RgbaImage, px: f32, color, text: &str, bold, step| {
+            let text = ellipsize(&font, px, text, info_w);
+            draw_text(img, &font, px, info_x as f32, ty as f32, color, &text, bold);
+            ty += step;
         };
-        draw_centered(
-            &mut img,
-            &font,
-            30.0,
-            cx,
-            (y + PAD + 44) as f32,
-            TEXT,
-            &ellipsize(&font, 30.0, player, inner),
-            false,
-        );
-        let (build_label, build_color) = match (&member.build, build) {
-            (_, Some(b)) => (b.name.clone(), DIM),
-            (Some(name), None) => (format!("{name} (introuvable)"), [210, 110, 110]),
-            (None, None) => ("Aucun build".to_owned(), DIM),
-        };
-        draw_centered(
-            &mut img,
-            &font,
-            26.0,
-            cx,
-            (y + PAD + 80) as f32,
-            build_color,
-            &ellipsize(&font, 26.0, &build_label, inner),
-            false,
-        );
-        for (i, line) in wrap(&font, 24.0, &member.note, inner, 2).iter().enumerate() {
-            draw_centered(
+        line(&mut img, 38.0, accent, role, true, 46);
+        if any_player {
+            match member.player.trim() {
+                "" => line(&mut img, 28.0, FAINT, "—", false, 36),
+                name => line(&mut img, 28.0, TEXT, name, false, 36),
+            }
+        }
+        match (&member.build, build) {
+            (_, Some(b)) => {
+                let color = if any_player { DIM } else { TEXT };
+                line(&mut img, 26.0, color, &b.name, false, 32);
+            }
+            (Some(name), None) => line(
                 &mut img,
-                &font,
-                24.0,
-                cx,
-                (y + PAD + 114 + i as i64 * 28) as f32,
-                DIM,
-                line,
+                26.0,
+                DANGER,
+                &format!("{name} (introuvable)"),
                 false,
-            );
+                32,
+            ),
+            (None, None) => line(&mut img, 26.0, FAINT, "Aucun build", false, 32),
+        }
+        for note in wrap(&font, 22.0, &member.note, info_w, 2) {
+            line(&mut img, 22.0, DIM, &note, false, 26);
         }
 
-        let grid_x = x + (COL_W - (2 * TILE + TILE_GAP)) / 2;
-        for (i, slot) in Slot::ALL.into_iter().enumerate() {
-            let tx = grid_x + (i as i64 % 2) * (TILE + TILE_GAP);
-            let ty = y + col_head + (i as i64 / 2) * (TILE + TILE_GAP);
-            match build.and_then(|b| b.get(slot)) {
-                Some(e) => {
-                    let (icon, _) = icon_for(icons, items, &e.item, e.enchant);
-                    draw_icon(&mut img, &font, icon, tx, ty, TILE as u32);
-                    draw_badge(
-                        &mut img,
-                        &font,
-                        e.enchant,
-                        tx + TILE - 2,
-                        ty + TILE - 2,
-                        24.0,
-                    );
+        let ghost = build.and_then(|b| two_handed_icon(b, items, icons));
+        let gy = y + PAD + (row_h - 2 * PAD - grid_h) / 2;
+        for (i, &slot) in slots.iter().enumerate() {
+            let tx = column_x(i);
+            well(&mut img, tx, gy, TILE, 16);
+            let Some(e) = build.and_then(|b| b.get(slot)) else {
+                match ghost.filter(|_| slot == Slot::OffHand) {
+                    Some(ghost) => draw_ghost(&mut img, ghost, tx, gy, TILE, TILE_INSET),
+                    None => slot_name(&mut img, &font, slot, tx, gy, TILE),
                 }
-                None => round_rect(&mut img, tx, ty, TILE, TILE, 12, [30, 33, 42]),
-            }
+                continue;
+            };
+            let (icon, _) = icon_for(icons, items, &e.item, e.enchant);
+            draw_icon(&mut img, &font, icon, tx, gy, TILE, TILE_INSET);
+            draw_badge(
+                &mut img,
+                &font,
+                e.enchant,
+                tx + TILE - 4,
+                gy + TILE - 4,
+                24.0,
+            );
+            // Swaps sit centred right under the item they replace.
+            let shown = e.swaps.len().min(MINI_PER_TILE) as i64;
+            let strip_w = shown * MINI + (shown - 1).max(0) * MINI_GAP;
+            draw_swaps(
+                &mut img,
+                &font,
+                items,
+                icons,
+                e,
+                tx + (TILE - strip_w) / 2,
+                gy + TILE + 10,
+                MINI_PER_TILE,
+                MINI_PER_TILE as i64,
+                (MINI, MINI_GAP),
+            );
         }
     }
 
-    let footer = "AO Comp Builder";
+    let footer_y = (height - footer_h + 18) as f32;
+    if any_swaps {
+        draw_text(
+            &mut img,
+            &font,
+            24.0,
+            MARGIN as f32,
+            footer_y,
+            DIM,
+            "Petites icônes : swaps de l'objet au-dessus",
+            false,
+        );
+    }
+    draw_signature(&mut img, &font, (width - MARGIN) as f32, footer_y);
+    Ok(img)
+}
+
+/// Small signature ending at `right`; `top` is where a 24 px footer line starts, so both share a baseline.
+fn draw_signature(img: &mut RgbaImage, font: &FontRef, right: f32, top: f32) {
+    const PX: f32 = 18.0;
+    const SIGNATURE: &str = "AOCompBuilder by slayde";
     draw_text(
-        &mut img,
-        &font,
-        24.0,
-        (width - MARGIN) as f32 - text_width(&font, 24.0, footer),
-        (height - footer_h + 14) as f32,
+        img,
+        font,
+        PX,
+        right - text_width(font, PX, SIGNATURE),
+        top + (24.0 - PX) * 0.83,
         DIM,
-        footer,
+        SIGNATURE,
         false,
     );
-    Ok(img)
+}
+
+/// Name of an empty slot, faint, in the middle of its square.
+fn slot_name(img: &mut RgbaImage, font: &FontRef, slot: Slot, x: i64, y: i64, size: i64) {
+    const PX: f32 = 20.0;
+    const LINE: f32 = 24.0;
+    let lines = wrap(font, PX, slot.label(), (size - 16) as f32, 2);
+    let top =
+        centered_top(PX, (y + size / 2) as f32) - (lines.len() as f32 - 1.0).max(0.0) * LINE / 2.0;
+    for (i, line) in lines.iter().enumerate() {
+        draw_centered(
+            img,
+            font,
+            PX,
+            (x + size / 2) as f32,
+            top + i as f32 * LINE,
+            FAINT,
+            line,
+            false,
+        );
+    }
+}
+
+/// Roles in order of first appearance with how many members hold each; case is ignored when
+/// grouping and the first spelling is kept.
+fn role_groups(comp: &Composition) -> Vec<(String, usize)> {
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    for role in comp.members.iter().map(|m| m.role.trim()) {
+        if role.is_empty() {
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|(g, _)| g.to_lowercase() == role.to_lowercase())
+        {
+            Some((_, n)) => *n += 1,
+            None => groups.push((role.to_owned(), 1)),
+        }
+    }
+    groups
 }
 
 #[cfg(test)]
@@ -1153,10 +1530,11 @@ mod tests {
         let items = Items::for_builds(&builds, &c);
         let render = |n| render_comp(&comp(n), &builds, &items, &icons).unwrap();
         let (one, six, seven) = (render(1), render(6), render(7));
-        assert_eq!(one.width(), 1400);
-        assert_eq!(six.width(), 2 * 60 + 6 * 330 + 5 * 30);
-        assert_eq!(seven.width(), six.width());
-        assert!(seven.height() > six.height(), "7th member starts a new row");
+        // One column per slot, whatever the member count: the sample fills all ten.
+        assert_eq!(one.width(), 2 * 60 + 330 + 10 * 128 + 9 * 16 + 18);
+        assert_eq!(seven.width(), one.width());
+        assert!(six.height() > one.height());
+        assert!(seven.height() > six.height(), "one row per member");
         assert!(is_drawn(&six));
 
         let empty = render_comp(&comp(0), &builds, &items, &icons).unwrap();
@@ -1169,6 +1547,58 @@ mod tests {
         assert!(is_drawn(
             &render_comp(&broken, &builds, &items, &icons).unwrap()
         ));
+    }
+
+    #[test]
+    fn comp_makes_room_for_swaps_and_skips_slots_nobody_fills() {
+        let c = catalog();
+        let size = |b: &Build| {
+            let comp = Composition {
+                name: "3v3".into(),
+                members: vec![Member {
+                    role: "DPS".into(),
+                    build: Some(b.name.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let builds = [b.clone()];
+            let items = Items::for_builds(&builds, &c);
+            render_comp(&comp, &builds, &items, &fake_icons(b, &c))
+                .unwrap()
+                .dimensions()
+        };
+        let plain = sample(&c, 0);
+        let mut no_bag = plain.clone();
+        no_bag.clear(Slot::Bag);
+        no_bag.clear(Slot::Mount);
+        assert!(
+            size(&sample(&c, 2)).1 > size(&plain).1,
+            "room for the swaps"
+        );
+        assert_eq!(
+            size(&plain).0 - size(&no_bag).0,
+            2 * (128 + 16),
+            "bag and mount columns left out"
+        );
+    }
+
+    #[test]
+    fn roles_are_grouped_and_coloured() {
+        let member = |role: &str| Member {
+            role: role.into(),
+            ..Default::default()
+        };
+        let comp = Composition {
+            members: ["DPS", "Heal", "dps", " ", "Scout"].map(member).to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            role_groups(&comp),
+            [("DPS".into(), 2), ("Heal".into(), 1), ("Scout".into(), 1)]
+        );
+        assert_ne!(role_color("Main heal"), role_color("Off-tank"));
+        assert_eq!(role_color("Scout"), GOLD);
     }
 
     #[test]

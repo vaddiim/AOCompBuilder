@@ -54,6 +54,8 @@ pub(super) struct ExportState {
     progress: Progress,
     rx: Receiver<Msg>,
     result: Option<Result<PathBuf, String>>,
+    /// Outcome of the last "Copier l'image".
+    copied: Option<Result<(), String>>,
 }
 
 impl ExportState {
@@ -301,6 +303,7 @@ impl App {
             progress: Progress::Icons { done: 0, total: 0 },
             rx,
             result: None,
+            copied: None,
         });
     }
 
@@ -327,6 +330,27 @@ impl App {
                                 .small()
                                 .color(MUTED),
                         );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(primary_button("Copier l'image"))
+                                .on_hover_text(
+                                    "Pour la coller directement dans Discord, un message…",
+                                )
+                                .clicked()
+                            {
+                                state.copied =
+                                    Some(clipboard_image(path).map(|img| ui.ctx().copy_image(img)));
+                            }
+                            match &state.copied {
+                                Some(Ok(())) => {
+                                    ui.weak("Image copiée.");
+                                }
+                                Some(Err(e)) => {
+                                    ui.colored_label(DANGER, e.as_str());
+                                }
+                                None => {}
+                            }
+                        });
                         ui.horizontal(|ui| {
                             if ui.button("Ouvrir le dossier").clicked() {
                                 reveal(path);
@@ -374,6 +398,15 @@ fn progress_ui(ui: &mut egui::Ui, progress: Progress) {
             });
         }
     }
+}
+
+/// The exported PNG, read back for the clipboard.
+fn clipboard_image(path: &Path) -> Result<egui::ColorImage, String> {
+    let img = image::open(path)
+        .map_err(|e| format!("Impossible de lire l'image : {e}"))?
+        .to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Ok(egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
 }
 
 /// Shows `path` selected in the file manager.
@@ -702,6 +735,7 @@ mod tests {
             progress: Progress::Icons { done: 0, total: 0 },
             rx,
             result: None,
+            copied: None,
         };
         tx.send(Msg::Progress(Progress::Icons { done: 1, total: 3 }))
             .unwrap();
@@ -714,6 +748,21 @@ mod tests {
     }
 
     #[test]
+    fn exported_png_is_read_back_for_the_clipboard() {
+        let dir = std::env::temp_dir().join(format!("aocb-clip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("comp.png");
+        image::RgbaImage::from_pixel(3, 2, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .unwrap();
+        let img = clipboard_image(&path).unwrap();
+        assert_eq!(img.size, [3, 2]);
+        assert_eq!(img.pixels[0], egui::Color32::from_rgb(10, 20, 30));
+        assert!(clipboard_image(&dir.join("absent.png")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_vanished_worker_is_reported_as_a_failure() {
         let (tx, rx) = mpsc::channel::<Msg>();
         let mut state = ExportState {
@@ -721,6 +770,7 @@ mod tests {
             progress: Progress::Rendering,
             rx,
             result: None,
+            copied: None,
         };
         drop(tx);
         state.poll();

@@ -35,7 +35,10 @@ Run from the project root (the app resolves `assets/` and `userdata/` from the w
     `my_builds.rs` saved builds; `comps.rs` compositions; `dialogs.rs` import/export, rename and confirmation windows.
     A `build_detail` screen is planned.
 - `export_image.rs` – PNG export of a build or composition, drawn off-screen (no egui, can run on a worker thread);
-  fetches 217 px icons on demand into `userdata/cache/icons_hd`, else uses the 64 px ones.
+  fetches 217 px icons on demand into `userdata/cache/icons_hd`, else uses the 64 px ones. Icons are drawn with their
+  frame fitted to the slot square (`icon_box`: the render service leaves a transparent margin). A composition is a table:
+  one row per member with the whole equipment on one line, one column per slot (slots nobody fills are left out), each item's
+  swaps in small under it, and roles get a colour from their name (`role_color`).
 - `main.rs` – startup: loads the catalog, `userdata/builds.json` and `comps.json`, opens the window.
 
 Asset folders: `assets/data` (dumps, `spell_loc.json`, `item_loc.json`, cache), `assets/icons`, `assets/fonts`.
